@@ -113,7 +113,7 @@ app.get('/', (req, res) => {
                                 html += \`
                                     <div class="device-item">
                                         <input type="checkbox" class="device-checkbox" value="\${device.id}" \${isChecked} onchange="validateSelection()">
-                                        <label>Mạch [ID: \${device.id.substring(0, 6)}...] - IP: \${device.ip}</label>
+                                        <label>Mạch [ID: \${device.id.substring(0, 20)}...] - IP: \${device.ip}</label>
                                     </div>
                                 \`;
                             });
