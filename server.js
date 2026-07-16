@@ -8,24 +8,25 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const upload = multer({ limits: { fileSize: 2 * 1024 * 1024 } });
 
-// BIẾN LƯU TRỮ THÔNG TIN KẾT NỐI ESP THỰC TẾ
 let espConnection = null;
+let lastHeartbeat = 0; // Lưu thời gian (ms) cuối cùng nhận được phản hồi từ ESP
 
 function getActiveESP() {
-    // Chỉ trả về kết nối nếu socket thực sự mở VÀ đã vượt qua bài test ping/pong gần nhất
-    if (espConnection && espConnection.readyState === WebSocket.OPEN && espConnection.isAlive) {
+    const now = Date.now();
+    // ESP được coi là ONLINE nếu socket OPEN và phản hồi "pong" thực tế cách đây không quá 7 giây
+    if (espConnection && espConnection.readyState === WebSocket.OPEN && (now - lastHeartbeat) < 7000) {
         return espConnection;
     }
     return null;
 }
 
-// API endpoint để giao diện Web tự động check trạng thái (gọi mỗi 2 giây)
+// API endpoint để giao diện Web check trạng thái (2 giây một lần)
 app.get('/api/status', (req, res) => {
     const esp = getActiveESP();
     res.json({ online: esp !== null });
 });
 
-// Giao diện Web động (Không bị giật màn hình khi tải lại)
+// Giao diện điều khiển Web
 app.get('/', (req, res) => {
     const esp = getActiveESP();
     const isOnline = esp !== null;
@@ -49,20 +50,16 @@ app.get('/', (req, res) => {
         <body>
             <div class="container">
                 <h2>Cloud to ESP-12E Programmer</h2>
-                
                 <div id="statusBox" class="status-box ${isOnline ? 'online' : 'offline'}">
                     ĐANG KIỂM TRA TRẠNG THÁI...
                 </div>
-
                 <form action="/upload" method="post" enctype="multipart/form-data">
                     <p>Chọn file chương trình:</p>
                     <input type="file" name="hexFile" accept=".hex" required style="margin-bottom: 20px; width: 100%;">
                     <button type="submit" id="submitBtn" class="btn btn-primary" ${!isOnline ? 'disabled' : ''}>Nạp Code</button>
                 </form>
             </div>
-
             <script>
-                // Tự động kiểm tra trạng thái thực tế của ESP qua API mỗi 2 giây
                 const statusBox = document.getElementById('statusBox');
                 const submitBtn = document.getElementById('submitBtn');
 
@@ -82,9 +79,8 @@ app.get('/', (req, res) => {
                         })
                         .catch(err => console.error("Lỗi cập nhật trạng thái:", err));
                 }
-
-                setInterval(checkStatus, 2000); // Check liên tục mỗi 2 giây
-                checkStatus(); // Chạy ngay lần đầu tải trang
+                setInterval(checkStatus, 2000);
+                checkStatus();
             </script>
         </body>
         </html>
@@ -113,47 +109,54 @@ app.post('/upload', upload.single('hexFile'), (req, res) => {
 wss.on('connection', (ws) => {
     console.log('Phát hiện kết nối mới từ ESP-12E!');
     
-    // Đóng kết nối cũ nếu có thiết bị mới trùng lặp kết nối đè lên
     if (espConnection) {
         espConnection.terminate();
     }
 
     espConnection = ws;
-    ws.isAlive = true;
+    lastHeartbeat = Date.now(); // Reset bộ đếm thời gian khi có kết nối mới
 
-    ws.on('pong', () => {
-        ws.isAlive = true; // Xác nhận mạch thực sự còn sống khi phản hồi ping
+    // Lắng nghe tin nhắn TEXT thông thường từ ESP
+    ws.on('message', (message) => {
+        const msgStr = message.toString();
+        
+        if (msgStr === "pong") {
+            lastHeartbeat = Date.now(); // Ghi nhận ESP vừa trả lời "pong" thật
+        }
     });
 
     ws.on('close', () => {
-        console.log('ESP-12E đóng kết nối chủ động.');
+        console.log('ESP-12E báo đóng kết nối.');
         if (espConnection === ws) espConnection = null;
     });
 
     ws.on('error', (err) => {
-        console.error('Lỗi kết nối socket:', err.message);
+        console.error('Lỗi socket:', err.message);
         if (espConnection === ws) espConnection = null;
     });
 });
 
-// HỆ THỐNG TIMEOUT CHẶT CHẼ (Ping mỗi 5 giây để phát hiện đứt mạng cực nhanh)
+// CHU KỲ KIỂM TRA THỰC TẾ (Cứ mỗi 4 giây gửi chữ "ping" dạng text xuống ESP)
 const interval = setInterval(() => {
-    wss.clients.forEach((ws) => {
-        if (ws.isAlive === false) {
-            console.log('Phát hiện ESP mất liên lạc đột ngột (kết nối ma). Đang giải phóng...');
-            if (espConnection === ws) espConnection = null;
-            return ws.terminate(); 
-        }
+    if (espConnection && espConnection.readyState === WebSocket.OPEN) {
+        const now = Date.now();
         
-        ws.isAlive = false; // Đặt tạm thời về false, nếu ESP phản hồi pong nó sẽ chuyển lại thành true
-        ws.ping(); 
-    });
-}, 5000); // 5 giây quét một lần giúp phát hiện ngắt mạng chỉ trong vài giây
+        // Nếu đã quá 7 giây rồi mà ESP không gửi "pong" về -> Xóa kết nối ma
+        if (now - lastHeartbeat > 7000) {
+            console.log('Quá thời gian phản hồi thực tế! Ép hủy kết nối ma...');
+            espConnection.terminate();
+            espConnection = null;
+        } else {
+            // Gửi bản tin ping ứng dụng
+            espConnection.send("ping");
+        }
+    }
+}, 4000);
 
 wss.on('close', () => {
     clearInterval(interval);
 });
 
 server.listen(process.env.PORT || 3000, () => {
-    console.log('Cloud Server hoạt động...');
+    console.log('Server đang hoạt động...');
 });
