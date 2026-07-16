@@ -112,7 +112,8 @@ app.get('/', (req, res) => {
                                 const isChecked = checkedIds.includes(device.id) ? 'checked' : '';
                                 html += \`
                                     <div class="device-item">
-                                        <input type="checkbox" class="device-checkbox" value="\${device.id}" \${isChecked} onchange="validateSelection()">
+                                        <input type="checkbox" class="device-checkbox" value="${device.id}" ${isChecked} onchange="validateSelection()">
+                                        <!-- ĐÃ SỬA: Bỏ .substring(0, 6) để hiển thị trọn vẹn ID MAC -->
                                         <label style="font-family: monospace;">Mạch [${device.id}] - IP: ${device.ip}</label>
                                     </div>
                                 \`;
