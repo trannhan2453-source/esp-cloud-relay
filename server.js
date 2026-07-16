@@ -8,18 +8,16 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const upload = multer();
 
-// HÀM KIỂM TRA TRẠNG THÁI THỰC TẾ:
-// Quét trực tiếp trong bộ nhớ của WebSocket Server xem có client nào đang thực sự KẾT NỐI MỞ không
+// HÀM KIỂM TRA TRẠNG THÁI THỰC TẾ (Đã sửa lỗi vòng lặp)
 function getActiveESP() {
-    let activeWs = null;
-    wss.clients.forEach((client) => {
+    for (const client of wss.clients) {
+        // Nếu bạn có phân biệt ESP bằng URL (vd: ws://server/esp), bạn có thể kiểm tra client.url tại đây
         if (client.readyState === WebSocket.OPEN) {
-            activeWs = client;
+            return client; 
         }
-    });
-    return activeWs;
+    }
+    return null;
 }
-
 // Giao diện web nạp code cố định
 app.get('/', (req, res) => {
     const espSocket = getActiveESP();
