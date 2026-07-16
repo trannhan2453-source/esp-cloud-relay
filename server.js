@@ -2,153 +2,251 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const multer = require('multer');
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const upload = multer({ limits: { fileSize: 2 * 1024 * 1024 } });
 
-let espConnection = null;
-let lastHeartbeat = 0; // Lưu thời gian (ms) cuối cùng nhận được phản hồi từ ESP
+// QUẢN LÝ DANH SÁCH MẠCH BẰNG MAP
+// Key: socket (đối tượng ws), Value: { id, ip, lastHeartbeat }
+const espClients = new Map();
 
-function getActiveESP() {
+// Lấy danh sách các ESP thực sự đang hoạt động
+function getActiveESPs() {
     const now = Date.now();
-    // ESP được coi là ONLINE nếu socket OPEN và phản hồi "pong" thực tế cách đây không quá 7 giây
-    if (espConnection && espConnection.readyState === WebSocket.OPEN && (now - lastHeartbeat) < 7000) {
-        return espConnection;
+    const activeList = [];
+    
+    for (const [ws, info] of espClients.entries()) {
+        if (ws.readyState === WebSocket.OPEN && (now - info.lastHeartbeat) < 7000) {
+            activeList.push({ ws, ...info });
+        }
     }
-    return null;
+    return activeList;
 }
 
-// API endpoint để giao diện Web check trạng thái (2 giây một lần)
-app.get('/api/status', (req, res) => {
-    const esp = getActiveESP();
-    res.json({ online: esp !== null });
+// API lấy danh sách mạch đang online (cho giao diện AJAX gọi 2s một lần)
+app.get('/api/devices', (req, res) => {
+    const activeESPs = getActiveESPs().map(device => ({
+        id: device.id,
+        ip: device.ip
+    }));
+    res.json({ devices: activeESPs });
 });
 
-// Giao diện điều khiển Web
+// Giao diện web đa thiết bị
 app.get('/', (req, res) => {
-    const esp = getActiveESP();
-    const isOnline = esp !== null;
-
     res.send(`
         <html>
         <head>
-            <title>Cloud Arduino Programmer</title>
+            <title>Multi-Device Wireless Programmer</title>
             <meta charset="utf-8">
             <style>
                 body { font-family: Arial, sans-serif; margin: 40px; background-color: #f4f4f9; color: #333; }
-                .container { max-width: 500px; margin: auto; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-                .status-box { padding: 15px; border-radius: 5px; text-align: center; font-size: 18px; margin-bottom: 20px; font-weight: bold; }
-                .online { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-                .offline { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-                .btn { width: 100%; padding: 12px; font-size: 16px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; }
+                .container { max-width: 650px; margin: auto; padding: 25px; background: white; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+                .device-list { border: 1px solid #ccc; border-radius: 5px; padding: 10px; background: #fafafa; margin-bottom: 20px; max-height: 200px; overflow-y: auto; }
+                .device-item { display: flex; align-items: center; padding: 8px; border-bottom: 1px solid #eee; }
+                .device-item:last-child { border-bottom: none; }
+                .device-item input { margin-right: 12px; transform: scale(1.2); }
+                .btn { width: 100%; padding: 12px; font-size: 16px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; margin-bottom: 10px; }
                 .btn-primary { background-color: #007bff; color: white; }
                 .btn-primary:disabled { background-color: #c8c8c8; cursor: not-allowed; }
+                .btn-secondary { background-color: #28a745; color: white; }
+                .btn-secondary:disabled { background-color: #c8c8c8; cursor: not-allowed; }
+                .header-flex { display: flex; justify-content: space-between; align-items: center; }
+                .badge { background: #17a2b8; color: white; padding: 3px 8px; border-radius: 12px; font-size: 12px; }
             </style>
         </head>
         <body>
             <div class="container">
-                <h2>Cloud to ESP-12E Programmer</h2>
-                <div id="statusBox" class="status-box ${isOnline ? 'online' : 'offline'}">
-                    ĐANG KIỂM TRA TRẠNG THÁI...
+                <div class="header-flex">
+                    <h2>Multi-Device Programmer</h2>
+                    <span class="badge" id="deviceCount">0 thiết bị online</span>
                 </div>
+                
                 <form action="/upload" method="post" enctype="multipart/form-data">
-                    <p>Chọn file chương trình:</p>
+                    <p style="font-weight: bold;">1. Chọn danh sách mạch cần nạp:</p>
+                    <div class="device-list" id="deviceList">
+                        <div style="color: gray; text-align: center; padding: 15px;">Đang dò tìm thiết bị...</div>
+                    </div>
+
+                    <p style="font-weight: bold;">2. Chọn file chương trình (.hex):</p>
                     <input type="file" name="hexFile" accept=".hex" required style="margin-bottom: 20px; width: 100%;">
-                    <button type="submit" id="submitBtn" class="btn btn-primary" ${!isOnline ? 'disabled' : ''}>Nạp Code</button>
+                    
+                    <input type="hidden" name="targetDevices" id="targetDevicesInput">
+                    
+                    <button type="submit" id="btnNapChon" class="btn btn-primary" disabled onclick="prepareSubmit('selected')">Nạp các mạch đã chọn</button>
+                    <button type="submit" id="btnNapAll" class="btn btn-secondary" disabled onclick="prepareSubmit('all')">Nạp ĐỒNG LOẠT tất cả</button>
                 </form>
             </div>
-            <script>
-                const statusBox = document.getElementById('statusBox');
-                const submitBtn = document.getElementById('submitBtn');
 
-                function checkStatus() {
-                    fetch('/api/status')
+            <script>
+                const deviceListDiv = document.getElementById('deviceList');
+                const deviceCountBadge = document.getElementById('deviceCount');
+                const btnNapChon = document.getElementById('btnNapChon');
+                const btnNapAll = document.getElementById('btnNapAll');
+                const targetDevicesInput = document.getElementById('targetDevicesInput');
+
+                let currentDevices = [];
+
+                function updateDeviceList() {
+                    fetch('/api/devices')
                         .then(res => res.json())
                         .then(data => {
-                            if (data.online) {
-                                statusBox.innerText = "ONLINE (Sẵn sàng nạp)";
-                                statusBox.className = "status-box online";
-                                submitBtn.disabled = false;
-                            } else {
-                                statusBox.innerText = "OFFLINE (Không tìm thấy mạch)";
-                                statusBox.className = "status-box offline";
-                                submitBtn.disabled = true;
+                            currentDevices = data.devices;
+                            deviceCountBadge.innerText = currentDevices.length + " thiết bị online";
+                            
+                            if (currentDevices.length === 0) {
+                                deviceListDiv.innerHTML = '<div style="color: red; text-align: center; padding: 15px; font-weight: bold;">Không tìm thấy mạch nào trực tuyến!</div>';
+                                btnNapChon.disabled = true;
+                                btnNapAll.disabled = true;
+                                return;
                             }
+
+                            // Lưu lại danh sách các checkbox đã được tích trước đó để tránh bị reset khi reload danh sách
+                            const checkedIds = Array.from(document.querySelectorAll('.device-checkbox:checked')).map(cb => cb.value);
+
+                            let html = '';
+                            currentDevices.forEach((device) => {
+                                const isChecked = checkedIds.includes(device.id) ? 'checked' : '';
+                                html += \`
+                                    <div class="device-item">
+                                        <input type="checkbox" class="device-checkbox" value="\${device.id}" \${isChecked} onchange="validateSelection()">
+                                        <label>Mạch [ID: \${device.id.substring(0, 6)}...] - IP: \${device.ip}</label>
+                                    </div>
+                                \`;
+                            });
+                            deviceListDiv.innerHTML = html;
+                            btnNapAll.disabled = false;
+                            validateSelection();
                         })
-                        .catch(err => console.error("Lỗi cập nhật trạng thái:", err));
+                        .catch(err => console.error("Lỗi cập nhật thiết bị:", err));
                 }
-                setInterval(checkStatus, 2000);
-                checkStatus();
+
+                function validateSelection() {
+                    const checkedCount = document.querySelectorAll('.device-checkbox:checked').length;
+                    btnNapChon.disabled = (checkedCount === 0);
+                }
+
+                // Gộp danh sách ID thiết bị cần nạp vào input ẩn trước khi gửi form lên server
+                function prepareSubmit(mode) {
+                    if (mode === 'all') {
+                        // Tích chọn hết tất cả các checkbox trước khi gửi
+                        document.querySelectorAll('.device-checkbox').forEach(cb => cb.checked = true);
+                    }
+                    const checkedIds = Array.from(document.querySelectorAll('.device-checkbox:checked')).map(cb => cb.value);
+                    targetDevicesInput.value = JSON.stringify(checkedIds);
+                }
+
+                setInterval(updateDeviceList, 2000); // Tự cập nhật sau 2 giây
+                updateDeviceList();
             </script>
         </body>
         </html>
     `);
 });
 
-// Nhận file .hex và gửi đi
+// Xử lý nạp code (hỗ trợ cả chọn lọc và đồng loạt)
 app.post('/upload', upload.single('hexFile'), (req, res) => {
-    const espSocket = getActiveESP();
-    if (!espSocket) {
-        return res.status(400).send("<h3>Mạch đã ngoại tuyến! Không thể nạp.</h3><a href='/'>Quay lại</a>");
-    }
     if (!req.file) {
-        return res.status(400).send("<h3>Vui lòng chọn file .hex</h3><a href='/'>Quay lại</a>");
+        return res.status(400).send("<h3>Lỗi: Vui lòng chọn file .hex</h3><a href='/'>Quay lại</a>");
     }
 
-    espSocket.send(req.file.buffer, { binary: true }, (err) => {
-        if (err) {
-            return res.status(500).send("Lỗi đường truyền dữ liệu.");
+    let targetIds = [];
+    try {
+        targetIds = JSON.parse(req.body.targetDevices || "[]");
+    } catch (e) {
+        return res.status(400).send("Dữ liệu thiết bị đích không hợp lệ.");
+    }
+
+    if (targetIds.length === 0) {
+        return res.status(400).send("<h3>Lỗi: Hãy chọn ít nhất một thiết bị cần nạp!</h3><a href='/'>Quay lại</a>");
+    }
+
+    const activeList = getActiveESPs();
+    let sentCount = 0;
+
+    // Duyệt qua danh sách mạch đang online và gửi file song song
+    activeList.forEach(device => {
+        if (targetIds.includes(device.id)) {
+            device.ws.send(req.file.buffer, { binary: true }, (err) => {
+                if (err) {
+                    console.error(`Lỗi truyền tới ESP ${device.id}:`, err.message);
+                }
+            } );
+            sentCount++;
         }
-        res.send("<h3>Đang nạp code...</h3><p>Dữ liệu đã truyền xuống ESP-12E.</p><br><a href='/'>Quay lại</a>");
     });
+
+    res.send(`
+        <h3>Đang nạp code...</h3>
+        <p>Đã đẩy file xuống <b>${sentCount}/${targetIds.length}</b> mạch được yêu cầu.</p>
+        <p>Hãy kiểm tra tiến trình nạp trực tiếp trên các board mạch ATmega2560.</p>
+        <br><a href='/'>Quay lại</a>
+    `);
 });
 
 // Quản lý kết nối WebSocket
-wss.on('connection', (ws) => {
-    console.log('Phát hiện kết nối mới từ ESP-12E!');
+wss.on('connection', (ws, req) => {
+    const clientIp = req.socket.remoteAddress;
+    const deviceId = crypto.randomBytes(8).toString('hex'); // Tạo ID ngẫu nhiên cho mạch (hoặc có thể lấy MAC nếu ESP gửi lên lúc bắt đầu)
     
-    if (espConnection) {
-        espConnection.terminate();
-    }
+    console.log(`Mạch ESP-12E kết nối! IP: ${clientIp} | Tạm cấp ID: ${deviceId}`);
 
-    espConnection = ws;
-    lastHeartbeat = Date.now(); // Reset bộ đếm thời gian khi có kết nối mới
+    // Lưu vào Map quản lý kết nối
+    espClients.set(ws, {
+        id: deviceId,
+        ip: clientIp,
+        lastHeartbeat: Date.now()
+    });
 
-    // Lắng nghe tin nhắn TEXT thông thường từ ESP
     ws.on('message', (message) => {
         const msgStr = message.toString();
-        
+        // 1. Nếu ESP gửi tin nhắn định danh kèm MAC Address
+        if (msgStr.startsWith("identity:")) {
+            const macId = msgStr.split(":")[1];
+            const info = espClients.get(ws);
+            if (info) {
+                info.id = "ESP_" + macId; // Cập nhật ID ngẫu nhiên ban đầu thành ID cố định theo MAC
+                console.log(`[Server] Đã nhận diện mạch! Đổi tên thành: ${info.id}`);
+            }
+        }
         if (msgStr === "pong") {
-            lastHeartbeat = Date.now(); // Ghi nhận ESP vừa trả lời "pong" thật
+            const info = espClients.get(ws);
+            if (info) {
+                info.lastHeartbeat = Date.now(); // Cập nhật nhịp tim riêng lẻ
+            }
         }
     });
 
     ws.on('close', () => {
-        console.log('ESP-12E báo đóng kết nối.');
-        if (espConnection === ws) espConnection = null;
+        console.log(`Mạch [ID: ${deviceId}] đã ngắt kết nối.`);
+        espClients.delete(ws);
     });
 
     ws.on('error', (err) => {
-        console.error('Lỗi socket:', err.message);
-        if (espConnection === ws) espConnection = null;
+        console.error(`Lỗi socket tại mạch [ID: ${deviceId}]:`, err.message);
+        espClients.delete(ws);
     });
 });
 
-// CHU KỲ KIỂM TRA THỰC TẾ (Cứ mỗi 4 giây gửi chữ "ping" dạng text xuống ESP)
+// CHU KỲ KIỂM TRA THỰC TẾ RIÊNG BIỆT (Gửi ping tới từng mạch mỗi 4 giây)
 const interval = setInterval(() => {
-    if (espConnection && espConnection.readyState === WebSocket.OPEN) {
-        const now = Date.now();
-        
-        // Nếu đã quá 7 giây rồi mà ESP không gửi "pong" về -> Xóa kết nối ma
-        if (now - lastHeartbeat > 7000) {
-            console.log('Quá thời gian phản hồi thực tế! Ép hủy kết nối ma...');
-            espConnection.terminate();
-            espConnection = null;
+    const now = Date.now();
+    
+    for (const [ws, info] of espClients.entries()) {
+        if (ws.readyState === WebSocket.OPEN) {
+            // Quá 7 giây không nhận được pong thực tế từ mạch này
+            if (now - info.lastHeartbeat > 7000) {
+                console.log(`Mạch [ID: ${info.id}] mất liên lạc. Tiến hành hủy kết nối ma...`);
+                ws.terminate();
+                espClients.delete(ws);
+            } else {
+                ws.send("ping");
+            }
         } else {
-            // Gửi bản tin ping ứng dụng
-            espConnection.send("ping");
+            espClients.delete(ws);
         }
     }
 }, 4000);
@@ -158,5 +256,5 @@ wss.on('close', () => {
 });
 
 server.listen(process.env.PORT || 3000, () => {
-    console.log('Server đang hoạt động...');
+    console.log('Server đang hoạt động ở chế độ Multi-Device...');
 });
