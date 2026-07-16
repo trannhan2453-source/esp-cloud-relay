@@ -190,43 +190,51 @@ app.post('/upload', upload.single('hexFile'), (req, res) => {
 // Quản lý kết nối WebSocket
 wss.on('connection', (ws, req) => {
     const clientIp = req.socket.remoteAddress;
-    const deviceId = crypto.randomBytes(8).toString('hex'); // Tạo ID ngẫu nhiên cho mạch (hoặc có thể lấy MAC nếu ESP gửi lên lúc bắt đầu)
     
-    console.log(`Mạch ESP-12E kết nối! IP: ${clientIp} | Tạm cấp ID: ${deviceId}`);
+    // THAY ĐỔI: Không dùng ID ngẫu nhiên nữa, dùng ID tạm thời chờ mạch gửi định danh lên
+    console.log(`Có mạch kết nối mới từ IP: ${clientIp}. Đang chờ định danh...`);
 
-    // Lưu vào Map quản lý kết nối
+    // Lưu vào Map quản lý kết nối với ID tạm
     espClients.set(ws, {
-        id: deviceId,
+        id: "Chờ kết nối...", 
         ip: clientIp,
         lastHeartbeat: Date.now()
     });
 
     ws.on('message', (message) => {
         const msgStr = message.toString();
+        
         // 1. Nếu ESP gửi tin nhắn định danh kèm MAC Address
         if (msgStr.startsWith("identity:")) {
             const macId = msgStr.split(":")[1];
             const info = espClients.get(ws);
             if (info) {
-                info.id = "ESP_" + macId; // Cập nhật ID ngẫu nhiên ban đầu thành ID cố định theo MAC
-                console.log(`[Server] Đã nhận diện mạch! Đổi tên thành: ${info.id}`);
+                info.id = "ESP_" + macId; // Ghi đè bằng ID MAC cố định vĩnh viễn
+                console.log(`[Server] Đã nhận diện thành công mạch: ${info.id} (IP: ${info.ip})`);
             }
         }
+        
+        // 2. Kiểm tra nhịp tim
         if (msgStr === "pong") {
             const info = espClients.get(ws);
             if (info) {
-                info.lastHeartbeat = Date.now(); // Cập nhật nhịp tim riêng lẻ
+                info.lastHeartbeat = Date.now(); 
             }
         }
     });
 
+    // TỐI ƯU LOG: Lấy ID thực tế từ Map để khi ngắt kết nối hiển thị đúng tên ESP_MAC
     ws.on('close', () => {
-        console.log(`Mạch [ID: ${deviceId}] đã ngắt kết nối.`);
+        const info = espClients.get(ws);
+        const displayId = info ? info.id : "Không xác định";
+        console.log(`Mạch [ID: ${displayId}] đã ngắt kết nối.`);
         espClients.delete(ws);
     });
 
     ws.on('error', (err) => {
-        console.error(`Lỗi socket tại mạch [ID: ${deviceId}]:`, err.message);
+        const info = espClients.get(ws);
+        const displayId = info ? info.id : "Không xác định";
+        console.error(`Lỗi socket tại mạch [ID: ${displayId}]:`, err.message);
         espClients.delete(ws);
     });
 });
