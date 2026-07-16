@@ -110,13 +110,11 @@ app.get('/', (req, res) => {
                             let html = '';
                             currentDevices.forEach((device) => {
                                 const isChecked = checkedIds.includes(device.id) ? 'checked' : '';
-                                html += \`
-                                    <div class="device-item">
-                                        <input type="checkbox" class="device-checkbox" value="${device.id}" ${isChecked} onchange="validateSelection()">
-                                        <!-- ĐÃ SỬA: Bỏ .substring(0, 6) để hiển thị trọn vẹn ID MAC -->
-                                        <label style="font-family: monospace;">Mạch [${device.id}] - IP: ${device.ip}</label>
-                                    </div>
-                                \`;
+                                // Đã dọn sạch cú pháp backslash giúp trình duyệt đọc chuẩn xác full ID
+                                html += '<div class="device-item">' +
+                                        '<input type="checkbox" class="device-checkbox" value="' + device.id + '" ' + isChecked + ' onchange="validateSelection()">' +
+                                        '<label style="font-family: monospace; font-size: 14px;">Mạch [' + device.id + '] - IP: ' + device.ip + '</label>' +
+                                        '</div>';
                             });
                             deviceListDiv.innerHTML = html;
                             btnNapAll.disabled = false;
@@ -175,7 +173,7 @@ app.post('/upload', upload.single('hexFile'), (req, res) => {
                 if (err) {
                     console.error(`Lỗi truyền tới ESP ${device.id}:`, err.message);
                 }
-            } );
+            });
             sentCount++;
         }
     });
@@ -192,7 +190,6 @@ app.post('/upload', upload.single('hexFile'), (req, res) => {
 wss.on('connection', (ws, req) => {
     const clientIp = req.socket.remoteAddress;
     
-    // THAY ĐỔI: Không dùng ID ngẫu nhiên nữa, dùng ID tạm thời chờ mạch gửi định danh lên
     console.log(`Có mạch kết nối mới từ IP: ${clientIp}. Đang chờ định danh...`);
 
     // Lưu vào Map quản lý kết nối với ID tạm
@@ -224,7 +221,6 @@ wss.on('connection', (ws, req) => {
         }
     });
 
-    // TỐI ƯU LOG: Lấy ID thực tế từ Map để khi ngắt kết nối hiển thị đúng tên ESP_MAC
     ws.on('close', () => {
         const info = espClients.get(ws);
         const displayId = info ? info.id : "Không xác định";
