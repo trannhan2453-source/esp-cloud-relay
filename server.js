@@ -2,11 +2,12 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const multer = require('multer');
-const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+
+// Cấu hình multer chỉ nhận file tối đa 2MB
 const upload = multer({ limits: { fileSize: 2 * 1024 * 1024 } });
 
 // QUẢN LÝ DANH SÁCH MẠCH BẰNG MAP
@@ -35,7 +36,7 @@ app.get('/api/devices', (req, res) => {
     res.json({ devices: activeESPs });
 });
 
-// Giao diện web đa thiết bị
+// Giao diện web đa thiết bị (Đã sửa đổi để chấp nhận file .bin)
 app.get('/', (req, res) => {
     res.send(`
         <html>
@@ -61,7 +62,7 @@ app.get('/', (req, res) => {
         <body>
             <div class="container">
                 <div class="header-flex">
-                    <h2>Multi-Device Programmer</h2>
+                    <h2>Multi-Device Programmer (Binary Mode)</h2>
                     <span class="badge" id="deviceCount">0 thiết bị online</span>
                 </div>
                 
@@ -71,8 +72,9 @@ app.get('/', (req, res) => {
                         <div style="color: gray; text-align: center; padding: 15px;">Đang dò tìm thiết bị...</div>
                     </div>
 
-                    <p style="font-weight: bold;">2. Chọn file chương trình (.hex):</p>
-                    <input type="file" name="hexFile" accept=".hex" required style="margin-bottom: 20px; width: 100%;">
+                    <p style="font-weight: bold;">2. Chọn file chương trình (.bin):</p>
+                    <!-- THAY ĐỔI: Chấp nhận file .bin thay vì .hex -->
+                    <input type="file" name="binFile" accept=".bin" required style="margin-bottom: 20px; width: 100%;">
                     
                     <input type="hidden" name="targetDevices" id="targetDevicesInput">
                     
@@ -104,13 +106,11 @@ app.get('/', (req, res) => {
                                 return;
                             }
 
-                            // Lưu lại danh sách các checkbox đã được tích trước đó để tránh bị reset khi reload danh sách
                             const checkedIds = Array.from(document.querySelectorAll('.device-checkbox:checked')).map(cb => cb.value);
 
                             let html = '';
                             currentDevices.forEach((device) => {
                                 const isChecked = checkedIds.includes(device.id) ? 'checked' : '';
-                                // Đã dọn sạch cú pháp backslash giúp trình duyệt đọc chuẩn xác full ID
                                 html += '<div class="device-item">' +
                                         '<input type="checkbox" class="device-checkbox" value="' + device.id + '" ' + isChecked + ' onchange="validateSelection()">' +
                                         '<label style="font-family: monospace; font-size: 14px;">Mạch [' + device.id + '] - IP: ' + device.ip + '</label>' +
@@ -128,17 +128,15 @@ app.get('/', (req, res) => {
                     btnNapChon.disabled = (checkedCount === 0);
                 }
 
-                // Gộp danh sách ID thiết bị cần nạp vào input ẩn trước khi gửi form lên server
                 function prepareSubmit(mode) {
                     if (mode === 'all') {
-                        // Tích chọn hết tất cả các checkbox trước khi gửi
                         document.querySelectorAll('.device-checkbox').forEach(cb => cb.checked = true);
                     }
                     const checkedIds = Array.from(document.querySelectorAll('.device-checkbox:checked')).map(cb => cb.value);
                     targetDevicesInput.value = JSON.stringify(checkedIds);
                 }
 
-                setInterval(updateDeviceList, 2000); // Tự cập nhật sau 2 giây
+                setInterval(updateDeviceList, 2000);
                 updateDeviceList();
             </script>
         </body>
@@ -146,10 +144,10 @@ app.get('/', (req, res) => {
     `);
 });
 
-// Xử lý nạp code (hỗ trợ cả chọn lọc và đồng loạt)
-app.post('/upload', upload.single('hexFile'), (req, res) => {
+// THAY ĐỔI: Xử lý nạp file BIN nhận từ input "binFile"
+app.post('/upload', upload.single('binFile'), (req, res) => {
     if (!req.file) {
-        return res.status(400).send("<h3>Lỗi: Vui lòng chọn file .hex</h3><a href='/'>Quay lại</a>");
+        return res.status(400).send("<h3>Lỗi: Vui lòng chọn file .bin</h3><a href='/'>Quay lại</a>");
     }
 
     let targetIds = [];
@@ -166,9 +164,10 @@ app.post('/upload', upload.single('hexFile'), (req, res) => {
     const activeList = getActiveESPs();
     let sentCount = 0;
 
-    // Duyệt qua danh sách mạch đang online và gửi file song song
+    // Duyệt qua danh sách mạch đang online và đẩy trực tiếp Buffer nhị phân (.bin) song song xuống các ESP
     activeList.forEach(device => {
         if (targetIds.includes(device.id)) {
+            // Gửi dữ liệu dưới dạng binary hoàn chỉnh
             device.ws.send(req.file.buffer, { binary: true }, (err) => {
                 if (err) {
                     console.error(`Lỗi truyền tới ESP ${device.id}:`, err.message);
@@ -179,9 +178,9 @@ app.post('/upload', upload.single('hexFile'), (req, res) => {
     });
 
     res.send(`
-        <h3>Đang nạp code...</h3>
+        <h3>Đang nạp firmware nhị phân (.bin)...</h3>
         <p>Đã đẩy file xuống <b>${sentCount}/${targetIds.length}</b> mạch được yêu cầu.</p>
-        <p>Hãy kiểm tra tiến trình nạp trực tiếp trên các board mạch ATmega2560.</p>
+        <p>Hãy kiểm tra tiến trình nạp trực tiếp trên các board mạch ATmega2560 qua đèn báo hiệu.</p>
         <br><a href='/'>Quay lại</a>
     `);
 });
@@ -202,17 +201,17 @@ wss.on('connection', (ws, req) => {
     ws.on('message', (message) => {
         const msgStr = message.toString();
         
-        // 1. Nếu ESP gửi tin nhắn định danh kèm MAC Address
+        // 1. Nhận tin nhắn định danh từ ESP-12E
         if (msgStr.startsWith("identity:")) {
             const macId = msgStr.split(":")[1];
             const info = espClients.get(ws);
             if (info) {
-                info.id = "ESP_" + macId; // Ghi đè bằng ID MAC cố định vĩnh viễn
+                info.id = "ESP_" + macId; // Đăng ký ID chính thức
                 console.log(`[Server] Đã nhận diện thành công mạch: ${info.id} (IP: ${info.ip})`);
             }
         }
         
-        // 2. Kiểm tra nhịp tim
+        // 2. Nhận phản hồi duy trì nhịp tim (pong)
         if (msgStr === "pong") {
             const info = espClients.get(ws);
             if (info) {
@@ -236,7 +235,7 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// CHU KỲ KIỂM TRA THỰC TẾ RIÊNG BIỆT (Gửi ping tới từng mạch mỗi 4 giây)
+// Chu kỳ gửi Ping tự động mỗi 4 giây duy trì kết nối
 const interval = setInterval(() => {
     const now = Date.now();
     
@@ -244,7 +243,7 @@ const interval = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
             // Quá 7 giây không nhận được pong thực tế từ mạch này
             if (now - info.lastHeartbeat > 7000) {
-                console.log(`Mạch [ID: ${info.id}] mất liên lạc. Tiến hành hủy kết nối ma...`);
+                console.log(`Mạch [ID: ${info.id}] mất liên lạc. Tiến hành hủy kết nối...`);
                 ws.terminate();
                 espClients.delete(ws);
             } else {
@@ -261,5 +260,5 @@ wss.on('close', () => {
 });
 
 server.listen(process.env.PORT || 3000, () => {
-    console.log('Server đang hoạt động ở chế độ Multi-Device...');
+    console.log('Server đang hoạt động ở chế độ Multi-Device (.BIN firmware)...');
 });
