@@ -163,24 +163,27 @@ app.post('/upload', upload.single('binFile'), (req, res) => {
 
     const activeList = getActiveESPs();
     let sentCount = 0;
+    const CHUNK_SIZE = 1024; // Chia nhỏ file thành các gói 1KB để ESP không bị quá tải RAM
 
-    // Duyệt qua danh sách mạch đang online và đẩy trực tiếp Buffer nhị phân (.bin) song song xuống các ESP
     activeList.forEach(device => {
         if (targetIds.includes(device.id)) {
-            // Gửi dữ liệu dưới dạng binary hoàn chỉnh
-            device.ws.send(req.file.buffer, { binary: true }, (err) => {
-                if (err) {
-                    console.error(`Lỗi truyền tới ESP ${device.id}:`, err.message);
-                }
-            });
+            // Lưu thông tin file đang nạp trực tiếp vào thông tin kết nối của thiết bị
+            device.firmwareBuffer = req.file.buffer;
+            device.currentOffset = 0;
+            device.chunkSize = CHUNK_SIZE;
+
+            console.log(`[Server] Bắt đầu tiến trình nạp từng phần cho ${device.id}. Tổng kích thước: ${req.file.buffer.length} bytes`);
+            
+            // Gửi lệnh bắt đầu nạp kèm theo tổng kích thước file
+            device.ws.send(`START_UPDATE:${req.file.buffer.length}`);
             sentCount++;
         }
     });
 
     res.send(`
-        <h3>Đang nạp firmware nhị phân (.bin)...</h3>
-        <p>Đã đẩy file xuống <b>${sentCount}/${targetIds.length}</b> mạch được yêu cầu.</p>
-        <p>Hãy kiểm tra tiến trình nạp trực tiếp trên các board mạch ATmega2560 qua đèn báo hiệu.</p>
+        <h3>Đã khởi động tiến trình nạp từng phần (.bin)...</h3>
+        <p>Đang tiến hành truyền và nạp nối tiếp cho <b>${sentCount}/${targetIds.length}</b> mạch.</p>
+        <p>Bạn có thể theo dõi tiến độ nạp ngay trên Serial Monitor của ESP.</p>
         <br><a href='/'>Quay lại</a>
     `);
 });
@@ -199,23 +202,52 @@ wss.on('connection', (ws, req) => {
     });
 
     ws.on('message', (message) => {
-        const msgStr = message.toString();
-        
-        // 1. Nhận tin nhắn định danh từ ESP-12E
-        if (msgStr.startsWith("identity:")) {
-            const macId = msgStr.split(":")[1];
-            const info = espClients.get(ws);
-            if (info) {
-                info.id = "ESP_" + macId; // Đăng ký ID chính thức
-                console.log(`[Server] Đã nhận diện thành công mạch: ${info.id} (IP: ${info.ip})`);
-            }
+    const msgStr = message.toString();
+    
+    // 1. Nhận tin nhắn định danh từ ESP-12E
+    if (msgStr.startsWith("identity:")) {
+        const macId = msgStr.split(":")[1];
+        const info = espClients.get(ws);
+        if (info) {
+            info.id = "ESP_" + macId;
+            console.log(`[Server] Đã nhận diện thành công mạch: ${info.id} (IP: ${info.ip})`);
         }
-        
-        // 2. Nhận phản hồi duy trì nhịp tim (pong)
-        if (msgStr === "pong") {
-            const info = espClients.get(ws);
-            if (info) {
-                info.lastHeartbeat = Date.now(); 
+    }
+    
+    // 2. Nhận phản hồi duy trì nhịp tim
+    if (msgStr === "pong") {
+        const info = espClients.get(ws);
+        if (info) {
+            info.lastHeartbeat = Date.now(); 
+        }
+    }
+
+    // 3. ESP yêu cầu gửi gói dữ liệu tiếp theo (Giao thức bắt tay chia nhỏ file)
+    if (msgStr === "NEXT_CHUNK") {
+        const info = espClients.get(ws);
+        if (info && info.firmwareBuffer) {
+            const buffer = info.firmwareBuffer;
+            const offset = info.currentOffset;
+            const size = info.chunkSize;
+
+            if (offset < buffer.length) {
+                // Cắt lấy một khúc dữ liệu nhỏ (tối đa 1KB) để gửi
+                const end = Math.min(offset + size, buffer.length);
+                const chunk = buffer.subarray(offset, end);
+
+                // Di chuyển con trỏ offset cho lần tiếp theo
+                info.currentOffset = end;
+
+                // Gửi chunk dữ liệu nhị phân này cho ESP
+                ws.send(chunk, { binary: true });
+            } else {
+                // Đã truyền xong toàn bộ file
+                console.log(`[Server] Đã truyền hoàn tất file .bin tới mạch ${info.id}!`);
+                ws.send("UPDATE_COMPLETE");
+                // Giải phóng bộ nhớ trên server cho socket này
+                delete info.firmwareBuffer;
+                delete info.currentOffset;
+                }
             }
         }
     });
