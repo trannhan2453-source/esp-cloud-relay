@@ -147,32 +147,42 @@ app.get('/', (req, res) => {
 // THAY ĐỔI: Xử lý nạp file BIN nhận từ input "binFile"
 app.post('/upload', upload.single('binFile'), (req, res) => {
     if (!req.file) {
-        return res.status(400).send("<h3>Lỗi: Vui lòng chọn file .bin</h3>");
+        return res.status(400).send("<h3>Lỗi: Vui lòng chọn file .bin</h3><a href='/'>Quay lại</a>");
     }
 
     let targetIds = [];
     try {
         targetIds = JSON.parse(req.body.targetDevices || "[]");
     } catch (e) {
-        return res.status(400).send("Dữ liệu không hợp lệ.");
+        return res.status(400).send("Dữ liệu thiết bị đích không hợp lệ.");
+    }
+
+    if (targetIds.length === 0) {
+        return res.status(400).send("<h3>Lỗi: Hãy chọn ít nhất một thiết bị cần nạp!</h3><a href='/'>Quay lại</a>");
     }
 
     const activeList = getActiveESPs();
     let sentCount = 0;
 
+    // Duyệt qua danh sách mạch đang online và đẩy trực tiếp Buffer nhị phân (.bin) song song xuống các ESP
     activeList.forEach(device => {
         if (targetIds.includes(device.id)) {
-            // Lưu trữ buffer file và trạng thái nạp vào chính object quản lý thiết bị
-            device.firmwareBuffer = req.file.buffer;
-            device.currentPointer = 0;
-            
-            // Gửi lệnh TEXT báo hiệu: "Bắt đầu nạp, tổng kích thước file là X bytes"
-            device.ws.send(`START_UPDATE:${req.file.buffer.length}`);
+            // Gửi dữ liệu dưới dạng binary hoàn chỉnh
+            device.ws.send(req.file.buffer, { binary: true }, (err) => {
+                if (err) {
+                    console.error(`Lỗi truyền tới ESP ${device.id}:`, err.message);
+                }
+            });
             sentCount++;
         }
     });
 
-    res.send(`<h3>Đã kích hoạt tiến trình nạp cho ${sentCount} mạch!</h3><a href='/'>Quay lại</a>`);
+    res.send(`
+        <h3>Đang nạp firmware nhị phân (.bin)...</h3>
+        <p>Đã đẩy file xuống <b>${sentCount}/${targetIds.length}</b> mạch được yêu cầu.</p>
+        <p>Hãy kiểm tra tiến trình nạp trực tiếp trên các board mạch ATmega2560 qua đèn báo hiệu.</p>
+        <br><a href='/'>Quay lại</a>
+    `);
 });
 
 // Quản lý kết nối WebSocket
@@ -190,29 +200,22 @@ wss.on('connection', (ws, req) => {
 
     ws.on('message', (message) => {
         const msgStr = message.toString();
-        const info = espClients.get(ws);
-        if (!info) return;
-    
-        if (msgStr.startsWith("identity:")) { /* ... giữ nguyên ... */ }
-        if (msgStr === "pong") { /* ... giữ nguyên ... */ }
-    
-        // KHI ESP NẠP XONG 1 TRANG VÀ XIN TRANG TIẾP THEO
-        if (msgStr === "NEXT_PAGE" && info.firmwareBuffer) {
-            const PAGE_SIZE = 256;
-            const remainder = info.firmwareBuffer.length - info.currentPointer;
-            
-            if (remainder > 0) {
-                const chunkSize = Math.min(PAGE_SIZE, remainder);
-                // Cắt đúng 256 bytes (hoặc ít hơn ở trang cuối)
-                const chunk = info.firmwareBuffer.slice(info.currentPointer, info.currentPointer + chunkSize);
-                
-                // Gửi dạng Binary miếng nhỏ này xuống
-                ws.send(chunk, { binary: true });
-                info.currentPointer += chunkSize;
-            } else {
-                // Đã gửi hết file
-                ws.send("END_UPDATE");
-                delete info.firmwareBuffer;
+        
+        // 1. Nhận tin nhắn định danh từ ESP-12E
+        if (msgStr.startsWith("identity:")) {
+            const macId = msgStr.split(":")[1];
+            const info = espClients.get(ws);
+            if (info) {
+                info.id = "ESP_" + macId; // Đăng ký ID chính thức
+                console.log(`[Server] Đã nhận diện thành công mạch: ${info.id} (IP: ${info.ip})`);
+            }
+        }
+        
+        // 2. Nhận phản hồi duy trì nhịp tim (pong)
+        if (msgStr === "pong") {
+            const info = espClients.get(ws);
+            if (info) {
+                info.lastHeartbeat = Date.now(); 
             }
         }
     });
