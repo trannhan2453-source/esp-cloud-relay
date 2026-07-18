@@ -62,7 +62,7 @@ app.get('/', (req, res) => {
         <body>
             <div class="container">
                 <div class="header-flex">
-                    <h2>Multi-Device Programmer (Binary Mode)</h2>
+                    <h2>Nạp OTA AT2560 MLN RB</h2>
                     <span class="badge" id="deviceCount">0 thiết bị online</span>
                 </div>
                 
