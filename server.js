@@ -11,7 +11,7 @@ const wss = new WebSocket.Server({ server });
 const upload = multer({ limits: { fileSize: 2 * 1024 * 1024 } });
 
 // QUẢN LÝ DANH SÁCH MẠCH BẰNG MAP
-// Key: socket (đối tượng ws), Value: { id, ip, lastHeartbeat }
+// Key: socket (đối tượng ws), Value: { id, ip, lastHeartbeat, firmwareBuffer, currentOffset, chunkSize }
 const espClients = new Map();
 
 // Lấy danh sách các ESP thực sự đang hoạt động
@@ -20,7 +20,11 @@ function getActiveESPs() {
     const activeList = [];
     
     for (const [ws, info] of espClients.entries()) {
-        if (ws.readyState === WebSocket.OPEN && (now - info.lastHeartbeat) < 7000) {
+        // Cải tiến: Nếu mạch đang update, bỏ qua điều kiện timeout 7 giây để tránh ngắt kết nối oan
+        const isUpdating = !!info.firmwareBuffer;
+        const isAlive = isUpdating || (now - info.lastHeartbeat) < 7000;
+
+        if (ws.readyState === WebSocket.OPEN && isAlive) {
             activeList.push({ ws, ...info });
         }
     }
@@ -36,7 +40,7 @@ app.get('/api/devices', (req, res) => {
     res.json({ devices: activeESPs });
 });
 
-// Giao diện web đa thiết bị (Đã sửa đổi để chấp nhận file .bin)
+// Giao diện web đa thiết bị
 app.get('/', (req, res) => {
     res.send(`
         <html>
@@ -73,7 +77,6 @@ app.get('/', (req, res) => {
                     </div>
 
                     <p style="font-weight: bold;">2. Chọn file chương trình (.bin):</p>
-                    <!-- THAY ĐỔI: Chấp nhận file .bin thay vì .hex -->
                     <input type="file" name="binFile" accept=".bin" required style="margin-bottom: 20px; width: 100%;">
                     
                     <input type="hidden" name="targetDevices" id="targetDevicesInput">
@@ -144,7 +147,7 @@ app.get('/', (req, res) => {
     `);
 });
 
-// THAY ĐỔI: Xử lý nạp file BIN nhận từ input "binFile"
+// Xử lý tải file BIN và phân phối lệnh bắt đầu
 app.post('/upload', upload.single('binFile'), (req, res) => {
     if (!req.file) {
         return res.status(400).send("<h3>Lỗi: Vui lòng chọn file .bin</h3><a href='/'>Quay lại</a>");
@@ -161,29 +164,29 @@ app.post('/upload', upload.single('binFile'), (req, res) => {
         return res.status(400).send("<h3>Lỗi: Hãy chọn ít nhất một thiết bị cần nạp!</h3><a href='/'>Quay lại</a>");
     }
 
-    const activeList = getActiveESPs();
+    // Lấy danh sách kết nối WS gốc từ Map thay vì bản copy từ getActiveESPs
     let sentCount = 0;
-    const CHUNK_SIZE = 1024; // Chia nhỏ file thành các gói 1KB để ESP không bị quá tải RAM
+    const CHUNK_SIZE = 1024; 
 
-    activeList.forEach(device => {
-        if (targetIds.includes(device.id)) {
-            // Lưu thông tin file đang nạp trực tiếp vào thông tin kết nối của thiết bị
-            device.firmwareBuffer = req.file.buffer;
-            device.currentOffset = 0;
-            device.chunkSize = CHUNK_SIZE;
+    for (const [ws, info] of espClients.entries()) {
+        if (targetIds.includes(info.id) && ws.readyState === WebSocket.OPEN) {
+            info.firmwareBuffer = req.file.buffer;
+            info.currentOffset = 0;
+            info.chunkSize = CHUNK_SIZE;
 
-            console.log(`[Server] Bắt đầu tiến trình nạp từng phần cho ${device.id}. Tổng kích thước: ${req.file.buffer.length} bytes`);
+            console.log(`[Server] Kích hoạt tiến trình nạp cho ${info.id}. Kích thước: ${req.file.buffer.length} bytes`);
             
-            // Gửi lệnh bắt đầu nạp kèm theo tổng kích thước file
-            device.ws.send(`START_UPDATE:${req.file.buffer.length}`);
+            // Cập nhật lại nhịp tim để tránh bị ngắt ngay khi vừa bấm nút nạp
+            info.lastHeartbeat = Date.now(); 
+            ws.send(`START_UPDATE:${req.file.buffer.length}`);
             sentCount++;
         }
-    });
+    }
 
     res.send(`
         <h3>Đã khởi động tiến trình nạp từng phần (.bin)...</h3>
         <p>Đang tiến hành truyền và nạp nối tiếp cho <b>${sentCount}/${targetIds.length}</b> mạch.</p>
-        <p>Bạn có thể theo dõi tiến độ nạp ngay trên Serial Monitor của ESP.</p>
+        <p>Bạn có thể theo dõi tiến độ nạp ngay trên Giao diện Serial Monitor của ESP.</p>
         <br><a href='/'>Quay lại</a>
     `);
 });
@@ -191,10 +194,8 @@ app.post('/upload', upload.single('binFile'), (req, res) => {
 // Quản lý kết nối WebSocket
 wss.on('connection', (ws, req) => {
     const clientIp = req.socket.remoteAddress;
-    
     console.log(`Có mạch kết nối mới từ IP: ${clientIp}. Đang chờ định danh...`);
 
-    // Lưu vào Map quản lý kết nối với ID tạm
     espClients.set(ws, {
         id: "Chờ kết nối...", 
         ip: clientIp,
@@ -202,51 +203,46 @@ wss.on('connection', (ws, req) => {
     });
 
     ws.on('message', (message) => {
-    const msgStr = message.toString();
-    
-    // 1. Nhận tin nhắn định danh từ ESP-12E
-    if (msgStr.startsWith("identity:")) {
-        const macId = msgStr.split(":")[1];
+        const msgStr = message.toString();
         const info = espClients.get(ws);
-        if (info) {
+        if (!info) return;
+        
+        // 1. Nhận tin nhắn định danh từ ESP-12E
+        if (msgStr.startsWith("identity:")) {
+            const macId = msgStr.split(":")[1];
             info.id = "ESP_" + macId;
             console.log(`[Server] Đã nhận diện thành công mạch: ${info.id} (IP: ${info.ip})`);
         }
-    }
-    
-    // 2. Nhận phản hồi duy trì nhịp tim
-    if (msgStr === "pong") {
-        const info = espClients.get(ws);
-        if (info) {
+        
+        // 2. Nhận phản hồi duy trì nhịp tim
+        if (msgStr === "pong") {
             info.lastHeartbeat = Date.now(); 
         }
-    }
 
-    // 3. ESP yêu cầu gửi gói dữ liệu tiếp theo (Giao thức bắt tay chia nhỏ file)
-    if (msgStr === "NEXT_CHUNK") {
-        const info = espClients.get(ws);
-        if (info && info.firmwareBuffer) {
-            const buffer = info.firmwareBuffer;
-            const offset = info.currentOffset;
-            const size = info.chunkSize;
+        // 3. ESP yêu cầu gửi gói dữ liệu tiếp theo
+        if (msgStr === "NEXT_CHUNK") {
+            if (info.firmwareBuffer) {
+                const buffer = info.firmwareBuffer;
+                const offset = info.currentOffset;
+                const size = info.chunkSize;
 
-            if (offset < buffer.length) {
-                // Cắt lấy một khúc dữ liệu nhỏ (tối đa 1KB) để gửi
-                const end = Math.min(offset + size, buffer.length);
-                const chunk = buffer.subarray(offset, end);
+                // Reset nhịp tim liên tục khi đang truyền dữ liệu nhằm giữ cổng kết nối
+                info.lastHeartbeat = Date.now();
 
-                // Di chuyển con trỏ offset cho lần tiếp theo
-                info.currentOffset = end;
+                if (offset < buffer.length) {
+                    const end = Math.min(offset + size, buffer.length);
+                    const chunk = buffer.subarray(offset, end);
+                    info.currentOffset = end;
 
-                // Gửi chunk dữ liệu nhị phân này cho ESP
-                ws.send(chunk, { binary: true });
-            } else {
-                // Đã truyền xong toàn bộ file
-                console.log(`[Server] Đã truyền hoàn tất file .bin tới mạch ${info.id}!`);
-                ws.send("UPDATE_COMPLETE");
-                // Giải phóng bộ nhớ trên server cho socket này
-                delete info.firmwareBuffer;
-                delete info.currentOffset;
+                    // Gửi gói dữ liệu nhị phân
+                    ws.send(chunk, { binary: true });
+                } else {
+                    console.log(`[Server] Đã truyền hoàn tất file .bin tới mạch ${info.id}!`);
+                    ws.send("UPDATE_COMPLETE");
+                    
+                    // Giải phóng bộ nhớ đệm an toàn
+                    info.firmwareBuffer = null;
+                    info.currentOffset = 0;
                 }
             }
         }
@@ -273,9 +269,14 @@ const interval = setInterval(() => {
     
     for (const [ws, info] of espClients.entries()) {
         if (ws.readyState === WebSocket.OPEN) {
-            // Quá 7 giây không nhận được pong thực tế từ mạch này
+            // Nếu mạch đang bận cập nhật dữ liệu (.firmwareBuffer tồn tại), tạm thời miễn kiểm tra timeout
+            if (info.firmwareBuffer) {
+                continue; 
+            }
+
+            // Quá 7 giây không nhận được pong thực tế từ các mạch ở trạng thái rảnh
             if (now - info.lastHeartbeat > 7000) {
-                console.log(`Mạch [ID: ${info.id}] mất liên lạc. Tiến hành hủy kết nối...`);
+                console.log(`Mạch [ID: ${info.id}] mất liên lạc hoặc phản hồi chậm. Hủy kết nối...`);
                 ws.terminate();
                 espClients.delete(ws);
             } else {
